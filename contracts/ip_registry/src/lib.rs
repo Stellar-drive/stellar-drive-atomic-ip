@@ -444,12 +444,56 @@ impl IpRegistry {
     /// can be proven off-chain or revealed later without exposing the on-chain
     /// owner address at commit time. The on-chain `IpRecord.owner` is set to
     /// the contract address as a placeholder to avoid leaking the submitter.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `blinded_owner` - A 32-byte blinded owner identifier (e.g. `sha256(owner || nonce)`).
+    ///   Stored on-chain per commitment so ownership can be proved or revealed later.
+    /// * `commitment_hashes` - Non-empty vector of 32-byte commitment hashes to register.
+    ///   Each must not be all zeros and must be globally unique.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<u64>` — Assigned IP IDs in the same order as the input hashes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * `commitment_hashes` is empty (panics with `ZeroCommitmentHash` on the first iteration
+    ///   — callers should not pass an empty vector)
+    /// * Any `commitment_hash` is all zeros (`ZeroCommitmentHash` error, code 2)
+    /// * Any `commitment_hash` is already registered (`CommitmentAlreadyRegistered` error, code 3)
+    ///
+    /// # Auth Model
+    ///
+    /// No caller authorization is required. The submitter's identity is intentionally
+    /// not recorded on-chain; only the `blinded_owner` identifier is stored.
+    ///
+    /// # Events
+    ///
+    /// Emits one `"ip_commit_anon"` event per commitment:
+    /// - Topics: `(symbol_short!("ip_commit_anon"), contract_address)`
+    /// - Data: `(ip_id: u64, timestamp: u64, blinded_owner: BytesN<32>)`
+    ///
+    /// # Storage
+    ///
+    /// Per commitment hash, two persistent keys are written:
+    /// - `DataKey::CommitmentOwner(hash)` → contract address (duplicate guard)
+    /// - `DataKey::AnonymousOwner(hash)` → `blinded_owner` (ownership proof pointer)
     pub fn batch_commit_ip_anonymous(
         env: Env,
         blinded_owner: BytesN<32>,
         commitment_hashes: Vec<BytesN<32>>,
     ) -> Vec<u64> {
         // No caller auth required for anonymous commits.
+
+        // Reject empty batch — nothing to commit.
+        if commitment_hashes.is_empty() {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ZeroCommitmentHash as u32,
+            ));
+        }
 
         // Initialize admin on first call if not set
         if !env.storage().persistent().has(&DataKey::Admin) {
@@ -534,6 +578,26 @@ impl IpRegistry {
         Self::update_commitment_checksum(&env);
 
         ids
+    }
+
+    /// Retrieve the blinded owner identifier stored for an anonymous commitment.
+    ///
+    /// Returns `Some(blinded_owner)` if the commitment was registered via
+    /// `batch_commit_ip_anonymous`, or `None` if no anonymous owner record exists
+    /// for the given hash (e.g. it was committed via `commit_ip` or `batch_commit_ip`).
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `commitment_hash` - The 32-byte commitment hash to look up
+    ///
+    /// # Returns
+    ///
+    /// `Option<BytesN<32>>` — The blinded owner identifier, or `None`.
+    pub fn get_anonymous_owner(env: Env, commitment_hash: BytesN<32>) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AnonymousOwner(commitment_hash))
     }
 
     /// Transfer IP ownership to a new address.
