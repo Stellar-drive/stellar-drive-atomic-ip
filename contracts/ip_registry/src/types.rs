@@ -40,6 +40,7 @@ pub enum DataKey {
     IpVersionChain(u64),     // stores Vec<u64> of the full version chain rooted at a given IP
     OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
     NextChallengeId,         // Issue #433: monotonic challenge ID counter
+    EncryptionKeyRotation(u64), // Issue #434: stores Vec<BytesN<32>> of old commitment hashes
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
