@@ -38,20 +38,10 @@ pub enum DataKey {
     IpAccessGrants(u64),     // Issue #344: stores Vec of (grantee, access_level) for tiered access
     NotarySignature(u64),    // Issue #345: stores notary signature for timestamp notarization
     IpVersionChain(u64),     // stores Vec<u64> of the full version chain rooted at a given IP
-    AnonymousCommitments(BytesN<32>), // maps reveal_token -> AnonymousCommitment record
-}
-
-// ── Anonymous Commitment ──────────────────────────────────────────────────────
-
-/// An anonymous IP commitment where the owner is hidden until claim time.
-/// The `reveal_token` is a secret known only to the submitter; presenting it
-/// later proves ownership without having linked an address at commit time.
-#[contracttype]
-#[derive(Clone)]
-pub struct AnonymousCommitment {
-    pub commitment_hash: BytesN<32>,
-    pub timestamp: u64,
-    pub claimed: bool,
+    OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
+    NextChallengeId,         // Issue #433: monotonic challenge ID counter
+    EncryptionKeyRotation(u64), // Issue #434: stores Vec<BytesN<32>> of old commitment hashes
+    MerkleRoot(Address),     // Issue #435: cached Merkle root for an owner's commitment set
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -89,4 +79,17 @@ pub struct CoOwnerAddedEvent {
 pub struct CoOwnerRemovedEvent {
     pub ip_id: u64,
     pub co_owner: Address,
+}
+
+/// Issue #433: Challenge record for ownership proof challenge-response.
+#[contracttype]
+#[derive(Clone)]
+pub struct OwnershipChallenge {
+    pub challenge_id: u64,
+    pub ip_id: u64,
+    pub challenger: Address,
+    pub nonce: BytesN<32>,
+    pub response_hash: Option<BytesN<32>>,
+    pub verified: bool,
+    pub timestamp: u64,
 }
