@@ -85,7 +85,9 @@ pub enum DataKey {
     IpAccessGrants(u64),    // Issue #344: stores Vec of (grantee, access_level) for tiered access
     NotarySignature(u64),   // Issue #345: stores notary signature for timestamp notarization
     IpVersionChain(u64),    // stores Vec<u64> of the full version chain rooted at a given IP
-    AnonymousCommitments(BytesN<32>), // maps reveal_token -> AnonymousCommitment record
+    OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
+    NextChallengeId,         // Issue #433: monotonic challenge ID counter
+    EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -1297,6 +1299,102 @@ impl IpRegistry {
         Self::verify_merkle_proof(&env, &record.commitment_hash, &proof, &hashes)
     }
 
+    // ── Issue #435: Generate Merkle Proof ─────────────────────────────────────
+
+    /// Generate a Merkle proof for an IP commitment.
+    ///
+    /// Returns the sibling hashes needed to reconstruct the Merkle root from
+    /// the given IP's commitment hash. This allows proving IP membership in the
+    /// owner's set without revealing all other commitments.
+    ///
+    /// # Arguments
+    ///
+    /// * `ip_id` - The IP to generate a proof for
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<BytesN<32>>` of sibling hashes forming the proof path from leaf to root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist.
+    pub fn generate_merkle_proof(env: Env, ip_id: u64) -> Vec<BytesN<32>> {
+        let record = require_ip_exists(&env, ip_id);
+
+        let ip_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(record.owner.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        let mut leaves: Vec<BytesN<32>> = Vec::new(&env);
+        let mut leaf_index: u32 = 0;
+        let mut found_index: u32 = 0;
+
+        for id in ip_ids.iter() {
+            if let Some(rec) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(id))
+            {
+                if rec.commitment_hash == record.commitment_hash {
+                    found_index = leaf_index;
+                }
+                leaves.push_back(rec.commitment_hash);
+                leaf_index += 1;
+            }
+        }
+
+        Self::build_merkle_proof(&env, &leaves, found_index)
+    }
+
+    /// Build a Merkle proof for the leaf at `index` in `leaves`.
+    fn build_merkle_proof(env: &Env, leaves: &Vec<BytesN<32>>, index: u32) -> Vec<BytesN<32>> {
+        let mut proof = Vec::new(env);
+        if leaves.len() <= 1 {
+            return proof;
+        }
+
+        let mut current_level = leaves.clone();
+        let mut current_index = index;
+
+        while current_level.len() > 1 {
+            let sibling_index = if current_index % 2 == 0 {
+                current_index + 1
+            } else {
+                current_index - 1
+            };
+
+            let sibling = if sibling_index < current_level.len() {
+                current_level.get(sibling_index).unwrap()
+            } else {
+                // Odd node: duplicate itself
+                current_level.get(current_index).unwrap()
+            };
+            proof.push_back(sibling);
+
+            // Build next level
+            let mut next_level = Vec::new(env);
+            for i in (0..current_level.len()).step_by(2) {
+                let left = current_level.get(i).unwrap();
+                let right = if i + 1 < current_level.len() {
+                    current_level.get(i + 1).unwrap()
+                } else {
+                    left.clone()
+                };
+                let mut combined = Bytes::new(env);
+                combined.append(&left.into());
+                combined.append(&right.into());
+                let hash: BytesN<32> = env.crypto().sha256(&combined).into();
+                next_level.push_back(hash);
+            }
+            current_level = next_level;
+            current_index /= 2;
+        }
+
+        proof
+    }
+
     fn merkle_root(env: &Env, hashes: &Vec<BytesN<32>>) -> BytesN<32> {
         if hashes.len() == 0 {
             return BytesN::from_array(env, &[0u8; 32]);
@@ -1515,175 +1613,258 @@ impl IpRegistry {
         stored_checksum.unwrap() == recomputed_checksum
     }
 
-    /// Commit an IP anonymously — no owner address is stored on-chain.
-    ///
-    /// The caller supplies a `commitment_hash` (the Pedersen hash of their IP)
-    /// and a `reveal_token` (a secret 32-byte value they generate off-chain).
-    /// Only the `reveal_token` is used as the storage key; no address is
-    /// recorded, so on-chain observers cannot link the commitment to an identity.
-    ///
-    /// The caller must keep the `reveal_token` secret. Anyone who knows it can
-    /// call `claim_anonymous_ip` to assign ownership.
-    ///
-    /// # Privacy guarantees
-    /// - No address is stored at commit time.
-    /// - The `reveal_token` is the only link between the commitment and its
-    ///   future owner; it is never stored in plaintext alongside an address.
-    ///
-    /// # Limitations
-    /// - Network-level metadata (transaction sender, fee account) may still
-    ///   reveal the submitter to a network observer. Use a privacy relay or
-    ///   fee-sponsorship to mitigate this.
-    /// - The `reveal_token` must be kept secret; loss means the commitment
-    ///   can never be claimed.
-    ///
-    /// # Returns
-    /// The `reveal_token` echoed back for convenience.
-    pub fn commit_ip_anonymous(
-        env: Env,
-        commitment_hash: BytesN<32>,
-        reveal_token: BytesN<32>,
-    ) -> BytesN<32> {
-        require_non_zero_commitment(&env, &commitment_hash);
-        require_unique_commitment(&env, &commitment_hash);
+    // ── Issue #433: IP Ownership Proof Challenge ───────────────────────────────
 
-        // Ensure the reveal_token is not already in use.
-        if env
+    /// Issue a challenge for an IP ownership proof.
+    ///
+    /// A third party (challenger) issues a nonce-based challenge to the IP owner.
+    /// The owner must respond with sha256(commitment_hash || nonce) to prove ownership.
+    ///
+    /// Returns the challenge_id.
+    pub fn issue_ownership_challenge(env: Env, ip_id: u64, challenger: Address, nonce: BytesN<32>) -> u64 {
+        challenger.require_auth();
+        require_ip_exists(&env, ip_id);
+
+        let challenge_id: u64 = env
             .storage()
             .persistent()
-            .has(&DataKey::AnonymousCommitments(reveal_token.clone()))
-        {
-            panic_with_error!(&env, ContractError::CommitmentAlreadyRegistered);
-        }
+            .get(&DataKey::NextChallengeId)
+            .unwrap_or(1u64);
 
-        let record = AnonymousCommitment {
-            commitment_hash: commitment_hash.clone(),
+        let challenge = OwnershipChallenge {
+            challenge_id,
+            ip_id,
+            challenger,
+            nonce,
+            response_hash: None,
+            verified: false,
             timestamp: env.ledger().timestamp(),
-            claimed: false,
         };
 
         env.storage()
             .persistent()
-            .set(&DataKey::AnonymousCommitments(reveal_token.clone()), &record);
+            .set(&DataKey::OwnershipChallenge(challenge_id), &challenge);
         env.storage().persistent().extend_ttl(
-            &DataKey::AnonymousCommitments(reveal_token.clone()),
+            &DataKey::OwnershipChallenge(challenge_id),
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
-
-        // Mark the commitment hash as "taken" (value is a sentinel contract address)
-        // so duplicate-commitment checks work across both anonymous and named paths.
-        let sentinel = env.current_contract_address();
         env.storage()
             .persistent()
-            .set(&DataKey::CommitmentOwner(commitment_hash.clone()), &sentinel);
+            .set(&DataKey::NextChallengeId, &(challenge_id + 1));
         env.storage().persistent().extend_ttl(
-            &DataKey::CommitmentOwner(commitment_hash.clone()),
+            &DataKey::NextChallengeId,
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
 
-        env.events().publish(
-            (symbol_short!("anon_cmt"),),
-            record.timestamp,
-        );
-
-        reveal_token
+        challenge_id
     }
 
-    /// Claim an anonymous commitment by presenting the reveal token.
+    /// Respond to an ownership challenge.
     ///
-    /// Converts the anonymous commitment into a full `IpRecord` owned by
-    /// `owner`. The `owner` must authorize this transaction so that only the
-    /// holder of the private key for `owner` can claim the IP.
+    /// The IP owner responds with sha256(commitment_hash || nonce). The response
+    /// is stored on-chain for verification.
     ///
     /// # Panics
-    /// - `IpNotFound` if the `reveal_token` does not match any anonymous commitment.
-    /// - `CommitmentAlreadyRegistered` if the commitment has already been claimed.
     ///
-    /// # Returns
-    /// The new IP ID assigned to the claimed commitment.
-    pub fn claim_anonymous_ip(env: Env, reveal_token: BytesN<32>, owner: Address) -> u64 {
-        owner.require_auth();
-
-        let key = DataKey::AnonymousCommitments(reveal_token.clone());
-        let mut anon: AnonymousCommitment = env
+    /// Panics if the challenge does not exist or the caller is not the IP owner.
+    pub fn respond_to_ownership_challenge(env: Env, challenge_id: u64, response_hash: BytesN<32>) {
+        let mut challenge: OwnershipChallenge = env
             .storage()
             .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::IpNotFound));
+            .get(&DataKey::OwnershipChallenge(challenge_id))
+            .unwrap_or_else(|| env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32)));
 
-        if anon.claimed {
-            panic_with_error!(&env, ContractError::CommitmentAlreadyRegistered);
-        }
+        let record = require_ip_exists(&env, challenge.ip_id);
+        record.owner.require_auth();
 
-        // Assign the next IP ID.
-        let id: u64 = env
+        challenge.response_hash = Some(response_hash);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnershipChallenge(challenge_id), &challenge);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OwnershipChallenge(challenge_id),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+    }
+
+    /// Verify an ownership challenge response.
+    ///
+    /// Checks that the stored response_hash equals sha256(commitment_hash || nonce).
+    /// Marks the challenge as verified if valid.
+    ///
+    /// Returns `true` if the proof is valid, `false` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the challenge does not exist.
+    pub fn verify_ownership_challenge(env: Env, challenge_id: u64) -> bool {
+        let mut challenge: OwnershipChallenge = env
             .storage()
             .persistent()
-            .get(&DataKey::NextId)
-            .unwrap_or(1);
+            .get(&DataKey::OwnershipChallenge(challenge_id))
+            .unwrap_or_else(|| env.panic_with_error(Error::from_contract_error(ContractError::IpNotFound as u32)));
 
-        let record = IpRecord {
-            ip_id: id,
-            owner: owner.clone(),
-            commitment_hash: anon.commitment_hash.clone(),
-            timestamp: anon.timestamp, // preserve original anonymous timestamp
-            revoked: false,
-            co_owners: Vec::new(&env),
-            parent_ip_id: None,
-            notary_signature: None,
+        let response_hash = match challenge.response_hash.clone() {
+            Some(h) => h,
+            None => return false,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::IpRecord(id), &record);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::IpRecord(id), LEDGER_BUMP, LEDGER_BUMP);
+        let record = require_ip_exists(&env, challenge.ip_id);
 
-        // Append to owner index.
-        let mut ids: Vec<u64> = env
+        // Expected: sha256(commitment_hash || nonce)
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&record.commitment_hash.into());
+        preimage.append(&challenge.nonce.clone().into());
+        let expected: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        let valid = response_hash == expected;
+        if valid {
+            challenge.verified = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::OwnershipChallenge(challenge_id), &challenge);
+            env.storage().persistent().extend_ttl(
+                &DataKey::OwnershipChallenge(challenge_id),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+        }
+        valid
+    }
+
+    /// Retrieve an ownership challenge by ID.
+    ///
+    /// Returns `None` if the challenge does not exist.
+    pub fn get_ownership_challenge(env: Env, challenge_id: u64) -> Option<OwnershipChallenge> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnershipChallenge(challenge_id))
+    }
+
+    // ── Issue #434: Encryption Key Rotation ───────────────────────────────────
+
+    /// Rotate the commitment key for an IP.
+    ///
+    /// Allows the IP owner to update the commitment hash (e.g. after re-encrypting
+    /// with a new key). The caller must prove knowledge of the old commitment by
+    /// providing the original secret and blinding factor. The old commitment hash
+    /// is stored in rotation history for audit purposes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist, the caller is not the owner, the IP is
+    /// revoked, the old secret/blinding_factor do not match the stored commitment,
+    /// or the new hash is zero/duplicate.
+    pub fn rotate_commitment_key(
+        env: Env,
+        ip_id: u64,
+        new_commitment_hash: BytesN<32>,
+        old_secret: BytesN<32>,
+        old_blinding_factor: BytesN<32>,
+    ) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+        require_not_revoked(&env, &record);
+
+        // Verify old commitment
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&old_secret.into());
+        preimage.append(&old_blinding_factor.into());
+        let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
+        if computed != record.commitment_hash {
+            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+        }
+
+        // Validate new hash
+        require_non_zero_commitment(&env, &new_commitment_hash);
+        require_unique_commitment(&env, &new_commitment_hash);
+
+        // Store rotation history (append old hash)
+        let mut history: Vec<BytesN<32>> = env
             .storage()
             .persistent()
-            .get(&DataKey::OwnerIps(owner.clone()))
+            .get(&DataKey::EncryptionKeyRotation(ip_id))
             .unwrap_or(Vec::new(&env));
-        ids.push_back(id);
+        history.push_back(record.commitment_hash.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::OwnerIps(owner.clone()), &ids);
+            .set(&DataKey::EncryptionKeyRotation(ip_id), &history);
         env.storage().persistent().extend_ttl(
-            &DataKey::OwnerIps(owner.clone()),
+            &DataKey::EncryptionKeyRotation(ip_id),
             LEDGER_BUMP,
             LEDGER_BUMP,
         );
 
-        // Update commitment → owner mapping to the real owner now that it's claimed.
-        env.storage().persistent().set(
-            &DataKey::CommitmentOwner(anon.commitment_hash.clone()),
-            &owner,
-        );
-        env.storage().persistent().extend_ttl(
-            &DataKey::CommitmentOwner(anon.commitment_hash.clone()),
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
-
-        // Mark the anonymous record as claimed.
-        anon.claimed = true;
-        env.storage().persistent().set(&key, &anon);
-
-        env.storage().persistent().set(&DataKey::NextId, &(id + 1));
+        // Update CommitmentOwner index: remove old, add new
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::NextId, LEDGER_BUMP, LEDGER_BUMP);
+            .remove(&DataKey::CommitmentOwner(record.commitment_hash.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitmentOwner(new_commitment_hash.clone()), &record.owner);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CommitmentOwner(new_commitment_hash.clone()),
+            LEDGER_BUMP,
+            LEDGER_BUMP,
+        );
+
+        // Update the record
+        record.commitment_hash = new_commitment_hash.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpRecord(ip_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
 
         env.events().publish(
-            (symbol_short!("anon_clm"), owner.clone()),
-            (id, anon.timestamp),
+            (symbol_short!("key_rot"), record.owner),
+            (ip_id, new_commitment_hash),
         );
+    }
 
-        id
+    /// Get the key rotation history for an IP (list of old commitment hashes).
+    pub fn get_key_rotation_history(env: Env, ip_id: u64) -> Vec<BytesN<32>> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::EncryptionKeyRotation(ip_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ── Issue #432: Batch Commitment Verification ──────────────────────────────
+
+    /// Verify multiple IP commitments in a single call to reduce gas costs.
+    ///
+    /// Each entry is a tuple of (ip_id, secret, blinding_factor). Returns a
+    /// Vec<bool> in the same order — `true` if the commitment matches, `false` otherwise.
+    /// Non-existent IPs return `false` rather than panicking.
+    pub fn batch_verify_commitments(
+        env: Env,
+        verifications: Vec<(u64, BytesN<32>, BytesN<32>)>,
+    ) -> Vec<bool> {
+        let mut results = Vec::new(&env);
+        for entry in verifications.iter() {
+            let (ip_id, secret, blinding_factor) = entry;
+            let result = if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id))
+            {
+                let mut preimage = Bytes::new(&env);
+                preimage.append(&secret.into());
+                preimage.append(&blinding_factor.into());
+                let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
+                record.commitment_hash == computed
+            } else {
+                false
+            };
+            results.push_back(result);
+        }
+        results
     }
 }
 
