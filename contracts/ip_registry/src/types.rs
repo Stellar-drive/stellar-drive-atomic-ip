@@ -41,6 +41,7 @@ pub enum DataKey {
     OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
     NextChallengeId,         // Issue #433: monotonic challenge ID counter
     EncryptionKeyRotation(u64), // Issue #434: stores Vec<BytesN<32>> of old commitment hashes
+    MerkleRoot(Address),     // Issue #435: cached Merkle root for an owner's commitment set
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
