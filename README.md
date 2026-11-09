@@ -321,3 +321,12 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 - [Stellar Development Foundation](https://stellar.org) for Soroban
 - The global engineering community building without borders
 - Drips Wave for supporting public goods funding
+
+## Resolved Issues
+
+The following issues have been addressed in this release:
+
+- Added issue templates for bug reports and feature requests
+- Added contributing guidelines and CODEOWNERS
+- Improved repository documentation and onboarding
+
